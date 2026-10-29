@@ -1,0 +1,7 @@
+.env
+*.env.local
+
+# Uploaded project files live on the host; only the placeholder is versioned.
+/www/*
+!/www/index.php
+!/www/.gitkeep

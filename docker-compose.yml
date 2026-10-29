@@ -1,0 +1,135 @@
+name: devtest
+
+services:
+  # Apache 2.4 + PHP 8.3. Document root is the shared ./www directory.
+  web:
+    build:
+      context: ./web
+    container_name: devtest_web
+    # Loopback-only bind. Docker normally publishes on 0.0.0.0 and inserts its
+    # own iptables rules, which bypass the host firewall — so the 127.0.0.1
+    # prefix is what actually keeps this off the LAN, not ufw/firewalld.
+    ports:
+      - "127.0.0.1:${WEB_PORT:-8080}:80"
+    volumes:
+      - ./www:/var/www/html
+      - ./web/conf/php-dev.ini:/usr/local/etc/php/conf.d/zz-dev.ini:ro
+    environment:
+      TZ: ${TZ:-America/Argentina/Buenos_Aires}
+      DB_HOST: mysql
+      DB_PORT: "3306"
+      DB_NAME: ${MYSQL_DATABASE:-app}
+      DB_USER: ${MYSQL_USER:-app}
+      DB_PASSWORD: ${MYSQL_PASSWORD:-}
+      # Service name, not 127.0.0.1: from inside this container, loopback is the
+      # web container itself. Same reason DB_HOST is `mysql`.
+      MAIL_HOST: mailpit
+      # One variable drives the container bind, the published host port and this
+      # value, so the app and the server can never disagree on the port.
+      MAIL_PORT: ${MAILPIT_SMTP_PORT:-1125}
+    depends_on:
+      mysql:
+        condition: service_healthy
+    restart: unless-stopped
+    networks: [devnet]
+
+  # vsftpd. Same webroot as `web`, so an upload is served immediately.
+  ftp:
+    build:
+      context: ./ftp
+    container_name: devtest_ftp
+    ports:
+      - "127.0.0.1:${FTP_PORT:-21}:21"
+      # Passive data connections: the client opens a second, unpredictable port,
+      # so the whole range has to be published as-is. Also loopback-only.
+      - "127.0.0.1:${FTP_PASSIVE_MIN:-21000}-${FTP_PASSIVE_MAX:-21010}:${FTP_PASSIVE_MIN:-21000}-${FTP_PASSIVE_MAX:-21010}"
+    volumes:
+      - ./www:/var/www/html
+    environment:
+      FTP_USER: ${FTP_USER:-ftpuser}
+      FTP_PASSWORD: ${FTP_PASSWORD:?FTP_PASSWORD is required — copy .env.example to .env}
+      FTP_UID: ${FTP_UID:-1000}
+      # The group the web server runs as; uploads must carry it (see README).
+      WEB_GID: ${WEB_GID:-33}
+      PASV_ADDRESS: ${FTP_PASV_ADDRESS:-127.0.0.1}
+      PASV_MIN_PORT: ${FTP_PASSIVE_MIN:-21000}
+      PASV_MAX_PORT: ${FTP_PASSIVE_MAX:-21010}
+    restart: unless-stopped
+    networks: [devnet]
+
+  mysql:
+    image: mysql:8.4
+    container_name: devtest_mysql
+    command:
+      - --character-set-server=utf8mb4
+      - --collation-server=utf8mb4_unicode_ci
+    # No host port on purpose: in a real deploy the database is private and only
+    # the application reaches it. From the containers that is mysql:3306; from
+    # this machine use phpMyAdmin or `docker compose exec mysql mysql -u root -p`.
+    # Uncomment to attach a host GUI client — loopback keeps it off the LAN:
+    # ports:
+    #   - "127.0.0.1:${MYSQL_PORT:-3306}:3306"
+    environment:
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD:?MYSQL_ROOT_PASSWORD is required}
+      MYSQL_DATABASE: ${MYSQL_DATABASE:-app}
+      MYSQL_USER: ${MYSQL_USER:-app}
+      MYSQL_PASSWORD: ${MYSQL_PASSWORD:?MYSQL_PASSWORD is required}
+      # Space-separated list of extra schemas to create and grant to MYSQL_USER.
+      EXTRA_DATABASES: ${EXTRA_DATABASES:-}
+    volumes:
+      - mysql_data:/var/lib/mysql
+      # Creates any extra schemas listed in EXTRA_DATABASES and grants the app
+      # user access to them. Only runs while the volume is empty; see the
+      # README's "Database" section.
+      - ./mysql/init:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "mysqladmin ping -h 127.0.0.1 -u root -p\"$$MYSQL_ROOT_PASSWORD\" --silent"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 30s
+    restart: unless-stopped
+    networks: [devnet]
+
+  phpmyadmin:
+    image: phpmyadmin:5-apache
+    container_name: devtest_pma
+    ports:
+      - "127.0.0.1:${PMA_PORT:-8081}:80"
+    environment:
+      PMA_HOST: mysql
+      PMA_PORT: "3306"
+      UPLOAD_LIMIT: 128M
+    depends_on:
+      mysql:
+        condition: service_healthy
+    restart: unless-stopped
+    networks: [devnet]
+
+  # Catches every outgoing message so nothing escapes to a real mail server, and
+  # shows it in a web UI. SMTP listens on the same port inside and outside the
+  # compose network.
+  mailpit:
+    image: axllent/mailpit:v1.31
+    container_name: devtest_mailpit
+    ports:
+      - "127.0.0.1:${MAILPIT_SMTP_PORT:-1125}:${MAILPIT_SMTP_PORT:-1125}"
+      - "127.0.0.1:${MAILPIT_UI_PORT:-8025}:8025"
+    environment:
+      MP_SMTP_BIND_ADDR: "0.0.0.0:${MAILPIT_SMTP_PORT:-1125}"
+      MP_MAX_MESSAGES: ${MAILPIT_MAX_MESSAGES:-500}
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://127.0.0.1:8025/"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    restart: unless-stopped
+    networks: [devnet]
+
+volumes:
+  mysql_data:
+
+networks:
+  devnet:
+    driver: bridge
